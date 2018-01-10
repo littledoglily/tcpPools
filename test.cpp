@@ -6,6 +6,8 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
 
 #include "SocketTools.hpp"
 SocketPools epending_pool;
@@ -18,6 +20,12 @@ static void* server_thread(void* args) {
 	server_addr.sin_port = htons(20008);
 	bind(lis_socket, (sockaddr*)&server_addr, sizeof(server_addr));
 	listen(lis_socket, 10);
+	/*
+	struct epoll_event ev;
+	ev.data.fd = -1;
+	ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
+	epoll_ctl(epending_pool.GetEpollFd(), EPOLL_CTL_ADD, lis_socket, &ev);
+	*/
 	epending_pool.SetListenSocket(lis_socket);
 	while (epending_pool.PoolHasRun()) {
 		epending_pool.CheckItem();
