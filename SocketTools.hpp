@@ -6,15 +6,101 @@
 #include <cstdio>
 #include <climits>
 #include <sys/epoll.h>
+#include <sys/time.h>
 
 #include <unistd.h>
 #include <errno.h>
 #include <error.h>
 
-#include "../hppTools/BlockQueue.hpp"
+#include "../hppTools/NoCopy.hpp"
+#include "../hppTools/ConditionMutex.hpp"
 
 #define LOG(fmt, arg...) do {fprintf(stdout, "[NOTICE] [%s:%d]:"fmt"\n", __FILE__,  __LINE__, ##arg);} while(0);
-#define ERROR(fmt, arg...) do {fprintf(stderr, "[FATAL] [%s:%d]:"fmt"\n", __FILE__, __LINE__, ##arg);} while(0);
+#define ERROR(fmt, arg...) do {fprintf(stdout, "[FATAL] [%s:%d]:"fmt"\n", __FILE__, __LINE__, ##arg);} while(0);
+
+class SocketPools;
+typedef struct SocketItem {
+	int socket;
+	int socketStatus;
+	int socketActiveTime;
+	void* args;
+	struct timeval socketQueueTime;
+	SocketItem():socket(0), socketStatus(0), socketActiveTime(0), args(NULL) {
+		memset(&socketQueueTime, 0, sizeof(socketQueueTime));
+	}
+}SocketItem;	//SocketItem
+template <class T>
+class SocketBlockQueue: multiTools::NoCopy {
+ public:
+ 	explicit SocketBlockQueue(size_t length):Length_(length), Head_(0), Tail_(0), Size_(0), Smutex_(), Nullmutex_(Smutex_) {
+		Array_ = new (std::nothrow)T[Length_];
+		if (NULL == Array_) {
+			ERROR("alloc SocketBlockQueue failed!");
+		}
+	}
+	~SocketBlockQueue() {
+		if (Array_) {
+			delete Array_;
+			Array_ = NULL;
+		}
+	}
+	size_t Length() const {
+		multiTools::SuperMutexFriend localLock(&Smutex_);
+		return Size_;
+	}
+	bool IsEmpty() const {
+		return Length() == 0;
+	}
+	bool IsFull() const {
+		return Length() == Length_;
+	}
+	int Push(T offset, SocketItem* sitem, int status) {
+		if (offset < 0 || NULL == sitem) {
+			ERROR("offset is negative or sitem is null");
+			return -1;
+		}
+		multiTools::SuperMutexFriend localLock(&Smutex_);
+		if (((Head_ + 1) % Length_) == Tail_) {
+			ERROR("insert socket:%d failed, queue array[max_size:%d] overflow", sitem->socket, (int)Length_);
+			return -1;	
+		}
+		Size_ += 1;
+		Array_[Head_] = offset;
+		//设置参数和时间	
+		sitem->socketStatus = status;
+		gettimeofday(&(sitem->socketQueueTime), NULL);
+		sitem->socketActiveTime = sitem->socketQueueTime.tv_sec;
+		Head_ = (Head_ + 1) % Length_;
+		Nullmutex_.Notify();
+		return 0;
+	}
+	int Pop(T &offset, SocketItem* array, int status) {
+		if (NULL == array) {
+			ERROR("socketitem is null");
+			return -1;
+		}
+		multiTools::SuperMutexFriend localLock(&Smutex_);
+		while (Tail_ == Head_) {
+			Nullmutex_.Wait();	
+		}
+		Size_ -= 1;
+		offset = Array_[Tail_];
+		//
+		if (array[offset].socketStatus != status) {
+			return -1;
+		}
+		Tail_ = (Tail_ + 1) % Length_;
+		return 0;
+	}
+ private:
+	size_t Length_;
+	size_t Head_;
+	size_t Tail_;
+	size_t Size_;
+	T* Array_;
+	mutable multiTools::SuperMutex Smutex_;
+	multiTools::ConditionMutex Nullmutex_;
+}; //SocketBlockQueue
 
 class SocketPools 
 {
@@ -46,10 +132,10 @@ class SocketPools
 		SocketMinTimeOut_ = SocketReadTimeOut_;
 		EpollTimeOut_ = MAX_EPOLL_TIMEOUT;
 		
-		ReadyQueue_ = new (std::nothrow)multiTools::BlockQueue<int>[MAX_QUEUE_LEN];
+		ReadyQueue_ = new (std::nothrow)SocketBlockQueue<int>(MAX_QUEUE_LEN);
 		if (NULL == ReadyQueue_) {
 			ERROR("alloc BlockQueue failed!");
-			return -1;
+			return;
 		}
 		SocketPoolsRun_ = true;
 	}
@@ -63,7 +149,14 @@ class SocketPools
 			return -1;
 		}
 		SocketListenFd_ = listenSocket;
-		return EpollDelEvents(EpollFd_, -1, (EPOLLIN | EPOLLHUP | EPOLLERR));
+		struct epoll_event ev;
+		ev.data.fd = -1;
+		ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
+		if (epoll_ctl(EpollFd_, EPOLL_CTL_ADD, SocketListenFd_, &ev) < 0) {
+			ERROR("epoll add failed!socket[%d] error info:%s", SocketListenFd_, strerror(errno));
+			return -1;
+		}
+		return 0;
 	}
 	/*设置Socket长度*/
 	int SetSocketNum(size_t snum) {
@@ -102,7 +195,7 @@ class SocketPools
 		return 0;
 	}
 	/*设置连接超时时间*/
-	int SetSocketConnTimeOut_(int time) {
+	int SetSocketConnTimeOut(int time) {
 		if (0 >= time) {
 			ERROR("%s", "the time is not valide");
 			return -1;
@@ -166,10 +259,9 @@ class SocketPools
 		int ReadNum = 0;
 		int WriteNum = 0;
 		int BusyNum = 0;
-		//LastActiveOffset
+		int LastActiveOffset = 0;
 		SocketLastActive_ = INT_MAX;
 		for (size_t i = 0; i < SocketLen_; i++) {
-			//LOG("socket status:%d", SocketItemArray_[i].socketStatus);
 			switch (SocketItemArray_[i].socketStatus) {
 				case NOT_USED:
 					break;
@@ -186,7 +278,8 @@ class SocketPools
 					if (SocketLastActive_ > SocketItemArray_[i].socketActiveTime) {
 						SocketLastActive_ = SocketItemArray_[i].socketActiveTime;
 					}
-					//LastActiveOffset
+					LastActiveOffset = i;
+					break;
 				case READ_BUSY:
 					if (CurrentTime >= SocketItemArray_[i].socketActiveTime + SocketReadTimeOut_) {
 						LOG("socket index %d timeout,last_active[%d],read_timeout[%d],current_time[%d]", (int)i, SocketItemArray_[i].socketActiveTime, SocketReadTimeOut_, CurrentTime);
@@ -200,7 +293,7 @@ class SocketPools
 					if (SocketLastActive_ > SocketItemArray_[i].socketActiveTime) {
 						SocketLastActive_ = SocketItemArray_[i].socketActiveTime;
 					}
-					//LastActiveOffset
+					LastActiveOffset = i;
 					break;
 				case WRITE_BUSY:
 					if (CurrentTime >= SocketItemArray_[i].socketActiveTime + SocketWriteTimeOut_) {
@@ -215,18 +308,19 @@ class SocketPools
 					if (SocketLastActive_ > SocketItemArray_[i].socketActiveTime) {
 						SocketLastActive_ = SocketItemArray_[i].socketActiveTime;
 					}
-					//LastActiveOffset
+					LastActiveOffset = i;
 					break;
 				case BUSY:
 					BusyNum++;
-					SocketLastActive_ = CurrentTime;
-					//LastActiveOffset
+					SocketItemArray_[i].socketActiveTime = CurrentTime;
+					LastActiveOffset = i;
 					break;
 				default:
 					LOG("unkonw socket status %d", SocketItemArray_[i].socketStatus);
 					break;
 			}
 		}
+		SocketLen_ = LastActiveOffset + 1;
 		//线程问题
 		if (ReadyNum == 0 && (BusyNum + WriteNum + BusyNum) > 0) {
 			LOG("Ready:%d Busy:%d Read:%d Write:%d", ReadyNum, BusyNum, ReadNum, WriteNum);
@@ -254,13 +348,11 @@ class SocketPools
 	int CheckItem() {
 		CheckTimeOut();
 		int ChangeNum = EpollWait(EpollTimeOut_);
-		//第一次不一定是0吗？
 		if (0 >= ChangeNum) {
 			return ChangeNum;
 		}
 		int offset = -1;
 		int ret = -1;
-		//read  write socket make zero
 		for (int i = 0; i < ChangeNum; i++) {
 			if (EpollCheck_[i].data.fd == -1 && SocketListenFd_ > 0) {
 				int WorkSock = AcceptSock();
@@ -283,8 +375,9 @@ class SocketPools
 					ResetSocket(offset, false);
 				} else if (EpollCheck_[i].events & EPOLLIN) {
 					//do read
-					if (NULL != EventCallBack[SOCKET_READ]) {
-						
+					if (NULL != EventCallBackList[SOCKET_READ]) {
+						//todo
+						ret = 0;
 					} else {
 						ret = 0;
 					}
@@ -313,17 +406,34 @@ class SocketPools
 		//状态检查
 		if (SocketItemArray_[offset].socketStatus != READY &&
 			SocketItemArray_[offset].socketStatus != READ_BUSY) {
-			ERROR("socket:%d offset:%d status:%d is wrong!");
+			ERROR("socket:%d offset:%d status:%d is wrong!", SocketItemArray_[offset].socket, offset, SocketItemArray_[offset].socketStatus);
 			return -1;
 		}
-		if (ReadyQueue_->IsFull()) {
-			LOG("insert sock[%d] fail, queue array[max size:%d] overflow."SocketItemArray_[offset].socket, MAX_QUEUE_LEN);
+		if (0 > ReadyQueue_->Push(offset, &SocketItemArray_[offset], BUSY)) {
+			ERROR("insert into readyqueue_ failed!");
 			return -1;
 		}
-		ReadyQueue_->Push(offset);
-		SocketItemArray_[offset].socketStatus = BUSY;
-		gettimeofday(&(SocketItemArray_[offset].socketQueueTime), NULL);
-		SocketItemArray_[offset].socketActiveTime = SocketItemArray_[offset].socketQueueTime.tv_sec; 
+		return 0;
+	}
+	int GetReadyQueue(int& offset, int& socket) {
+		int fetch_offset = -1;
+		int fetch_socket = -1;
+		if (NULL == SocketItemArray_) {
+			ERROR("socket array is null!");
+			return -1;
+		}
+		if (0 > ReadyQueue_->Pop(fetch_offset, SocketItemArray_, BUSY)) {
+			ERROR("get offset from readyqueue_ failed!");
+			offset = -1;
+			socket = -1;
+			return -1;
+		}
+		fetch_socket = SocketItemArray_[fetch_offset].socket;
+		if (NULL != EventCallBackList[SOCKET_FETCH]) {
+			//todo
+		}
+		offset = fetch_offset;
+		socket = fetch_socket;
 		return 0;
 	}
 	int GetOffsetFromArray() {
@@ -357,11 +467,13 @@ class SocketPools
 		SocketItemArray_[current_offset].socket = worksock;
 		SocketItemArray_[current_offset].socketActiveTime = time(NULL);
 		SocketItemArray_[current_offset].socketStatus = READY;
-		return 0;
+		LOG("set socket:%d status:%d", worksock, SocketItemArray_[current_offset].socketStatus);
+		return current_offset;
 	}
 	//flags = 0 监听读事件，flags = 1监听写事件
 	int InsertSocket(int worksock, void* arg = NULL, int flags = 0) {
 		int offset = InsertSocketArray(worksock);
+		LOG("offset:%d", offset);
 		if (0 > offset) {
 			ERROR("insert socket failed!");
 			return -1;
@@ -522,6 +634,14 @@ class SocketPools
 		}
 		return 0;
 	}
+	int CloseSocket() {
+		int num = 0;
+		for (int i = 0; i < SocketLen_; i++) {
+			num++;
+			ResetSocket(i, false);
+		}
+		return num;
+	}
  private:
 	 enum {MAX_SOCKET_NUM = 1024};
 	 enum {MAX_QUEUE_LEN = 500};
@@ -536,16 +656,6 @@ class SocketPools
 		BUSY,
 		WRITE_BUSY
 	 }SocketStatus;	//SocketStatus
-	 typedef struct SocketItem {
-		int socket;
-		int socketStatus;
-		int socketActiveTime;
-		void* args;
-		struct timeval socketQueueTime;
-		SocketItem():socket(0), socketStatus(0), socketActiveTime(0), args(NULL) {
-			memset(&socketQueueTime, 0, sizeof(socketQueueTime));
-		}
-	 }SocketItem;	//SocketItem
 	 typedef enum {
 		SOCKET_ACCEPT = 0,
 		SOCKET_INIT,
@@ -577,7 +687,7 @@ class SocketPools
 	 int SocketMinTimeOut_;
 	 int EpollTimeOut_;
 	 //队列
-	 multiTools::BlockQueue<int>* ReadyQueue_;
+	 SocketBlockQueue<int>* ReadyQueue_;
 }; //SocketPools
 
 #endif //SOCKETTOOLS_H_
